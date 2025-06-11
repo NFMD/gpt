@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-selfcheck.json
+
+# Data - Assuming we might store data locally, adjust if using a DB primarily
+data/
+
+# Configuration - Sensitive file
+config/config.yaml
+
+# IDE specific
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
