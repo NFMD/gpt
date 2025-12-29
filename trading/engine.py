@@ -8,7 +8,8 @@ from datetime import datetime
 from typing import List, Dict, Optional
 from pathlib import Path
 from api import KISApi
-from strategy import StockScreener, TechnicalAnalyzer, SectorAnalyzer
+from strategy import StockScreener, TechnicalAnalyzer, SectorAnalyzer, TradeHistory, KellyCriterion
+from command_center import CommandCenter
 from config import Config
 
 
@@ -24,6 +25,13 @@ class TradingEngine:
         self.screener = StockScreener(api)
         self.technical_analyzer = TechnicalAnalyzer(api)
         self.sector_analyzer = SectorAnalyzer()
+
+        # 거래 실적 추적 및 켈리 공식
+        self.trade_history = TradeHistory()
+        self.kelly = KellyCriterion(self.trade_history)
+
+        # 커맨드 센터 (AI 의사결정)
+        self.command_center = CommandCenter(api, self.trade_history)
 
         self.portfolio_file = Path(__file__).parent.parent / "data" / "portfolio.json"
         self.trade_log_file = Path(__file__).parent.parent / "logs" / "trades.log"
@@ -88,12 +96,13 @@ class TradingEngine:
         for idx, stock in enumerate(analyzed_candidates[:Config.MAX_STOCKS], 1):
             value_in_billions = stock['trading_value'] / 100000000
             logger.info(
-                f"\n{idx}. {stock['stock_name']} ({stock['stock_code']}) - 점수: {stock['score']}/100\n"
+                f"\n{idx}. {stock['stock_name']} ({stock['stock_code']}) - 점수: {stock['score']}/110\n"
                 f"   현재가: {stock['current_price']:,}원 | "
                 f"등락률: {stock['change_rate']:+.2f}%\n"
                 f"   거래대금: {value_in_billions:,.0f}억원\n"
                 f"   신고가: {'✅' if stock['is_new_high'] else '❌'} | "
                 f"정배열: {'✅' if stock['is_aligned'] else '❌'} | "
+                f"200일선↗: {'✅' if stock.get('ma200_uptrend', False) else '❌'} | "
                 f"외국인+기관: {'✅' if stock['investor_buying']['both_buying'] else '❌'}"
             )
 
@@ -132,18 +141,53 @@ class TradingEngine:
         if not candidates:
             return False
 
+        # 커맨드 센터: AI 상황 분석 및 의사결정
+        situation_analysis = self.command_center.analyze_situation(candidates)
+
+        # AI 판단: 거래 실행 여부
+        if not self.command_center.should_trade(situation_analysis):
+            logger.warning("⚠️  커맨드 센터 판단: 거래 조건 미충족. 매수를 건너뜁니다.")
+            return False
+
         # 계좌 잔고 확인
         balance = self.api.get_balance()
         available_cash = balance['cash']
 
         logger.info(f"\n💵 사용 가능 현금: {available_cash:,}원")
 
-        # 종목당 투자 금액 계산
+        # 거래 실적 및 켈리 공식 추천 확인
+        recommendation = self.kelly.get_recommendation(recent_trades=20)
+        logger.info(f"\n💡 켈리 공식 추천: {recommendation}\n")
+
+        # 종목당 투자 금액 계산 (켈리 공식 + AI 포지션 조절)
         num_stocks = min(len(candidates), Config.MAX_STOCKS)
-        investment_per_stock = min(
-            available_cash // num_stocks,
-            Config.MAX_INVESTMENT_PER_STOCK
-        )
+
+        # 첫 번째 종목에 대해 켈리 비율 계산
+        if len(candidates) > 0:
+            kelly_info = self.kelly.calculate_position_size(
+                total_capital=available_cash,
+                stock_price=candidates[0]['current_price'],
+                recent_trades=20,
+                use_half_kelly=True
+            )
+
+            # AI 포지션 사이즈 조절 계수 적용
+            position_factor = self.command_center.get_position_sizing_factor(situation_analysis)
+
+            # 켈리 공식 + AI 조절
+            base_investment = kelly_info['investment_amount'] // num_stocks
+            adjusted_investment = int(base_investment * position_factor)
+
+            # 설정값 한도 내에서 조절
+            investment_per_stock = min(
+                adjusted_investment,
+                Config.MAX_INVESTMENT_PER_STOCK
+            )
+        else:
+            investment_per_stock = min(
+                available_cash // num_stocks,
+                Config.MAX_INVESTMENT_PER_STOCK
+            )
 
         logger.info(f"📊 종목당 투자 금액: {investment_per_stock:,}원 ({num_stocks}개 종목)")
 
@@ -280,6 +324,23 @@ class TradingEngine:
                         f"✅ 매도 완료: {stock_name} ({stock_code}) {quantity}주 @ {current_price:,}원 "
                         f"(수익: {profit:,}원, {profit_rate:+.2f}%)"
                     )
+
+                    # 거래 실적 기록
+                    trade_record = {
+                        "stock_code": stock_code,
+                        "stock_name": stock_name,
+                        "buy_date": holding['buy_date'],
+                        "sell_date": now.strftime("%Y-%m-%d"),
+                        "buy_price": buy_price,
+                        "sell_price": current_price,
+                        "quantity": quantity,
+                        "profit": profit,
+                        "profit_rate": profit_rate,
+                    }
+                    self.trade_history.add_trade(trade_record)
+
+                    # 커맨드 센터: 거래 결과 학습
+                    self.command_center.update_from_trade_result(profit_rate / 100)  # % -> 비율
 
         # 포트폴리오 업데이트
         if successful_sales:

@@ -8,6 +8,7 @@
   python main.py --mode buy          # 종가 베팅 실행
   python main.py --mode sell         # 오전 매도 실행
   python main.py --mode portfolio    # 포트폴리오 확인
+  python main.py --mode dashboard    # 커맨드 센터 대시보드
   python main.py --mode scheduler    # 자동 스케줄러 실행 (기본값)
 """
 import argparse
@@ -22,7 +23,7 @@ def main():
     parser = argparse.ArgumentParser(description='한국 주식 자동매매 프로그램')
     parser.add_argument(
         '--mode',
-        choices=['scan', 'buy', 'sell', 'portfolio', 'scheduler'],
+        choices=['scan', 'buy', 'sell', 'portfolio', 'dashboard', 'scheduler'],
         default='scheduler',
         help='실행 모드 선택 (기본: scheduler)'
     )
@@ -55,6 +56,10 @@ def main():
         elif args.mode == 'portfolio':
             print("📂 포트폴리오 확인 모드")
             engine.check_portfolio()
+
+        elif args.mode == 'dashboard':
+            print("📊 커맨드 센터 대시보드 모드")
+            engine.command_center.print_dashboard()
 
         elif args.mode == 'scheduler':
             print("⏰ 자동 스케줄러 모드")
