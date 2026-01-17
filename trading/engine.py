@@ -14,7 +14,8 @@ from strategy import (
     SectorAnalyzer,
     TradeHistory,
     KellyCriterion,
-    IntradayAnalyzer
+    IntradayAnalyzer,
+    MorningMonitor
 )
 from command_center import CommandCenter
 from config import Config
@@ -35,6 +36,9 @@ class TradingEngine:
 
         # 장중 실시간 분석 (V자 반등 포착)
         self.intraday_analyzer = IntradayAnalyzer(api)
+
+        # 익일 오전 모니터링 (3분의 법칙, 이평선 추적)
+        self.morning_monitor = MorningMonitor(api)
 
         # 거래 실적 추적 및 켈리 공식
         self.trade_history = TradeHistory()
@@ -283,6 +287,12 @@ class TradingEngine:
         """
         익일 오전 매도 실행 (09:00-10:00)
 
+        전략:
+        - 3분의 법칙: 09:00-09:03 구간에서 시초가 미돌파 시 전량 매도
+        - 1분봉 20분 이평선: 이평선 이탈(-1.5%) 시 전량 매도
+        - 분할 매도: 33% → 33% → 34% 3단계 매도
+        - 09:50 이후 잔량 전량 정리
+
         Returns:
             실행 성공 여부
         """
@@ -308,13 +318,22 @@ class TradingEngine:
 
         # 매도 실행
         total_profit = 0
-        successful_sales = []
+        holdings_to_remove = []
 
         for holding in self.portfolio['holdings']:
             stock_code = holding['stock_code']
             stock_name = holding['stock_name']
-            quantity = holding['quantity']
+            total_quantity = holding['quantity']
             buy_price = holding['buy_price']
+
+            # 이미 매도된 수량 추적
+            sold_quantity = holding.get('sold_quantity', 0)
+            remaining_quantity = total_quantity - sold_quantity
+
+            if remaining_quantity <= 0:
+                logger.info(f"ℹ️  {stock_name}: 이미 전량 매도 완료")
+                holdings_to_remove.append(stock_code)
+                continue
 
             # 현재가 조회
             price_info = self.api.get_stock_price(stock_code)
@@ -324,68 +343,130 @@ class TradingEngine:
                 continue
 
             current_price = price_info['current_price']
-            profit = (current_price - buy_price) * quantity
             profit_rate = ((current_price - buy_price) / buy_price) * 100
 
             logger.info(
                 f"\n📊 {stock_name} ({stock_code})\n"
                 f"   매수가: {buy_price:,}원 → 현재가: {current_price:,}원\n"
-                f"   수익: {profit:,}원 ({profit_rate:+.2f}%)"
+                f"   잔여 수량: {remaining_quantity}주 / {total_quantity}주\n"
+                f"   수익률: {profit_rate:+.2f}%"
             )
 
-            # 매도 조건 체크
-            should_sell = (
-                    profit_rate >= Config.TARGET_PROFIT_RATE * 100 or  # 목표 수익률 달성
-                    profit_rate <= Config.STOP_LOSS_RATE * 100 or  # 손절 라인 도달
-                    current_time >= "09:50"  # 시간 마감 임박
+            # 매도 신호 판단
+            sell_quantity = 0
+            sell_reason = ""
+
+            # 1. 긴급 매도 신호: 3분의 법칙 또는 이평선 이탈
+            sell_signal = self.morning_monitor.get_sell_signal(
+                stock_code=stock_code,
+                stock_name=stock_name,
+                buy_price=buy_price,
+                current_price=current_price,
+                current_time=current_time
             )
 
-            if should_sell:
-                logger.info(f"🔔 매도 조건 충족")
+            if sell_signal['should_sell']:
+                # 긴급 신호: 전량 매도
+                sell_quantity = remaining_quantity
+                sell_reason = f"긴급 매도 ({sell_signal['reason']})"
+
+            # 2. 09:50 이후: 잔량 전량 정리
+            elif current_time >= "09:50":
+                sell_quantity = remaining_quantity
+                sell_reason = "시간 마감 (09:50 이후)"
+
+            # 3. 분할 매도 전략
+            else:
+                # 매도 단계 계산
+                sell_stage = sold_quantity // (total_quantity // 3 + 1)  # 0, 1, 2
+
+                # 각 단계별 수익률 기준
+                stage_targets = [
+                    (1, 2.0),   # 1단계: +2% 이상
+                    (2, 3.0),   # 2단계: +3% 이상
+                    (3, 5.0),   # 3단계: +5% 이상
+                ]
+
+                for stage, target_profit in stage_targets:
+                    if sell_stage < stage and profit_rate >= target_profit:
+                        # 해당 단계 매도 실행
+                        if stage == 1:
+                            sell_quantity = int(total_quantity * 0.33)
+                            sell_reason = f"1차 분할 매도 ({target_profit}% 도달)"
+                        elif stage == 2:
+                            first_sold = int(total_quantity * 0.33)
+                            sell_quantity = int(total_quantity * 0.33)
+                            sell_reason = f"2차 분할 매도 ({target_profit}% 도달)"
+                        else:  # stage == 3
+                            sell_quantity = remaining_quantity  # 잔량 전부
+                            sell_reason = f"3차 분할 매도 ({target_profit}% 도달)"
+                        break
+
+            # 4. 매도 실행
+            if sell_quantity > 0:
+                logger.info(f"🔔 매도 신호: {sell_reason}")
+                logger.info(f"📤 매도 수량: {sell_quantity}주 @ {current_price:,}원")
 
                 # 주문 실행
                 success = self.api.place_order(
                     stock_code=stock_code,
-                    quantity=quantity,
+                    quantity=sell_quantity,
                     price=current_price,
                     order_type="sell"
                 )
 
                 if success:
+                    # 수익 계산
+                    profit = (current_price - buy_price) * sell_quantity
                     total_profit += profit
-                    successful_sales.append(stock_code)
+
+                    # 매도 수량 업데이트
+                    holding['sold_quantity'] = sold_quantity + sell_quantity
 
                     self._log_trade(
-                        f"✅ 매도 완료: {stock_name} ({stock_code}) {quantity}주 @ {current_price:,}원 "
-                        f"(수익: {profit:,}원, {profit_rate:+.2f}%)"
+                        f"✅ 매도 완료: {stock_name} ({stock_code}) {sell_quantity}주 @ {current_price:,}원 "
+                        f"(수익: {profit:,}원, {profit_rate:+.2f}%) - {sell_reason}"
                     )
 
-                    # 거래 실적 기록
-                    trade_record = {
-                        "stock_code": stock_code,
-                        "stock_name": stock_name,
-                        "buy_date": holding['buy_date'],
-                        "sell_date": now.strftime("%Y-%m-%d"),
-                        "buy_price": buy_price,
-                        "sell_price": current_price,
-                        "quantity": quantity,
-                        "profit": profit,
-                        "profit_rate": profit_rate,
-                    }
-                    self.trade_history.add_trade(trade_record)
+                    # 전량 매도 완료 시 거래 실적 기록
+                    if holding['sold_quantity'] >= total_quantity:
+                        total_profit_amount = (current_price - buy_price) * total_quantity
 
-                    # 커맨드 센터: 거래 결과 학습
-                    self.command_center.update_from_trade_result(profit_rate / 100)  # % -> 비율
+                        trade_record = {
+                            "stock_code": stock_code,
+                            "stock_name": stock_name,
+                            "buy_date": holding['buy_date'],
+                            "sell_date": now.strftime("%Y-%m-%d"),
+                            "buy_price": buy_price,
+                            "sell_price": current_price,
+                            "quantity": total_quantity,
+                            "profit": total_profit_amount,
+                            "profit_rate": profit_rate,
+                        }
+                        self.trade_history.add_trade(trade_record)
+
+                        # 커맨드 센터: 거래 결과 학습
+                        self.command_center.update_from_trade_result(profit_rate / 100)
+
+                        # 포트폴리오에서 제거 표시
+                        holdings_to_remove.append(stock_code)
+                else:
+                    logger.warning(f"⚠️  {stock_name}: 매도 주문 실패")
+            else:
+                logger.info(f"⏸️  {stock_name}: 매도 조건 미충족 (보유 유지)")
 
         # 포트폴리오 업데이트
-        if successful_sales:
+        if holdings_to_remove or total_profit != 0:
+            # 전량 매도된 종목 제거
             self.portfolio['holdings'] = [
                 h for h in self.portfolio['holdings']
-                if h['stock_code'] not in successful_sales
+                if h['stock_code'] not in holdings_to_remove
             ]
             self._save_portfolio()
 
-            logger.info(f"\n✅ 총 {len(successful_sales)}개 종목 매도 완료")
+            logger.info(f"\n✅ 매도 실행 완료")
+            if holdings_to_remove:
+                logger.info(f"🗑️  포트폴리오에서 제거: {len(holdings_to_remove)}개 종목")
             logger.info(f"💰 총 수익: {total_profit:,}원")
             return True
         else:
