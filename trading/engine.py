@@ -8,7 +8,14 @@ from datetime import datetime
 from typing import List, Dict, Optional
 from pathlib import Path
 from api import KISApi
-from strategy import StockScreener, TechnicalAnalyzer, SectorAnalyzer, TradeHistory, KellyCriterion
+from strategy import (
+    StockScreener,
+    TechnicalAnalyzer,
+    SectorAnalyzer,
+    TradeHistory,
+    KellyCriterion,
+    IntradayAnalyzer
+)
 from command_center import CommandCenter
 from config import Config
 
@@ -25,6 +32,9 @@ class TradingEngine:
         self.screener = StockScreener(api)
         self.technical_analyzer = TechnicalAnalyzer(api)
         self.sector_analyzer = SectorAnalyzer()
+
+        # 장중 실시간 분석 (V자 반등 포착)
+        self.intraday_analyzer = IntradayAnalyzer(api)
 
         # 거래 실적 추적 및 켈리 공식
         self.trade_history = TradeHistory()
@@ -191,28 +201,53 @@ class TradingEngine:
 
         logger.info(f"📊 종목당 투자 금액: {investment_per_stock:,}원 ({num_stocks}개 종목)")
 
-        # 매수 실행
+        # 장중 실시간 분석: V자 반등 포착
+        logger.info("\n" + "🎯" * 30)
+        logger.info("장중 실시간 분석: V자 반등 포착")
+        logger.info("🎯" * 30 + "\n")
+
+        entry_signals = []
+        for stock in candidates[:num_stocks]:
+            signal = self.intraday_analyzer.get_entry_signal(
+                stock_code=stock['stock_code'],
+                stock_name=stock['stock_name']
+            )
+            if signal:
+                # 기존 종목 정보와 진입 신호 병합
+                entry_signals.append({**stock, **signal})
+
+        if not entry_signals:
+            logger.warning("⚠️  V자 반등 확인된 종목 없음. 매수를 건너뜁니다.")
+            return False
+
+        logger.info(f"\n✅ V자 반등 확인 종목: {len(entry_signals)}개")
+
+        # 매수 실행 (V자 반등 확인된 종목만)
         successful_purchases = []
 
-        for stock in candidates[:num_stocks]:
+        for stock in entry_signals:
             stock_code = stock['stock_code']
             stock_name = stock['stock_name']
-            current_price = stock['current_price']
+            entry_price = stock['entry_price']  # V자 반등 분석 시점의 가격
 
             # 매수 수량 계산
-            quantity = investment_per_stock // current_price
+            quantity = investment_per_stock // entry_price
 
             if quantity == 0:
-                logger.warning(f"⚠️  {stock_name}: 매수 수량 부족 (현재가 {current_price:,}원)")
+                logger.warning(f"⚠️  {stock_name}: 매수 수량 부족 (진입가 {entry_price:,}원)")
                 continue
 
             # 주문 실행
-            logger.info(f"\n🛒 매수 시도: {stock_name} ({stock_code}) {quantity}주 @ {current_price:,}원")
+            logger.info(
+                f"\n🛒 매수 시도: {stock_name} ({stock_code})\n"
+                f"   수량: {quantity}주 @ {entry_price:,}원\n"
+                f"   신호 강도: {stock['signal_strength']}/100"
+            )
 
             success = self.api.place_order(
                 stock_code=stock_code,
                 quantity=quantity,
-                price=current_price,
+                price=entry_price,
                 order_type="buy"
             )
 

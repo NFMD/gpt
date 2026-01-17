@@ -156,6 +156,64 @@ class KISApi:
             logger.error(f"❌ 등락률 상위 조회 오류: {e}")
             return []
 
+    def get_minute_price_history(
+        self,
+        stock_code: str,
+        interval: int = 1,
+        count: int = 30
+    ) -> List[Dict]:
+        """
+        분봉 데이터 조회 (장중 실시간 분석용)
+
+        Args:
+            stock_code: 종목코드
+            interval: 분봉 간격 (1, 3, 5, 10, 30, 60)
+            count: 조회할 봉 개수
+
+        Returns:
+            분봉 데이터 리스트 (최신순)
+        """
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
+        headers = self._get_headers("FHKST03010200")
+
+        # 분봉 구분 코드 매핑
+        interval_map = {1: "0", 3: "1", 5: "2", 10: "3", 30: "4", 60: "5"}
+        fid_etc_cls_code = interval_map.get(interval, "0")
+
+        params = {
+            "fid_etc_cls_code": fid_etc_cls_code,
+            "fid_cond_mrkt_div_code": "J",
+            "fid_input_iscd": stock_code,
+            "fid_input_hour_1": "",  # 공백이면 현재 시간 기준
+            "fid_pw_data_incu_yn": "Y",  # 과거 데이터 포함
+        }
+
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            if data["rt_cd"] == "0":
+                minute_data = []
+                for item in data["output2"][:count]:
+                    minute_data.append({
+                        "time": item["stck_bsop_date"] + item["stck_cntg_hour"],  # YYYYMMDDHHMMss
+                        "open": int(item["stck_oprc"]),
+                        "high": int(item["stck_hgpr"]),
+                        "low": int(item["stck_lwpr"]),
+                        "close": int(item["stck_prpr"]),
+                        "volume": int(item["cntg_vol"]),
+                        "trading_value": int(item["acml_tr_pbmn"]),  # 누적 거래대금
+                    })
+                return minute_data
+            else:
+                logger.warning(f"⚠️  분봉 조회 실패: {data.get('msg1', 'Unknown error')}")
+                return []
+
+        except Exception as e:
+            logger.error(f"❌ 분봉 조회 오류 ({stock_code}): {e}")
+            return []
+
     def get_daily_price_history(self, stock_code: str, days: int = 20) -> List[Dict]:
         """
         일봉 데이터 조회 (기술적 분석용)

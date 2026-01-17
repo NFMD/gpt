@@ -35,8 +35,8 @@ class Config:
     NEW_HIGH_DAYS = int(os.getenv('NEW_HIGH_DAYS', 20))
 
     # 시간 설정
-    BUY_TIME_START = os.getenv('BUY_TIME_START', '15:00')
-    BUY_TIME_END = os.getenv('BUY_TIME_END', '15:20')
+    BUY_TIME_START = os.getenv('BUY_TIME_START', '15:16')  # V자 반등 확인 시작
+    BUY_TIME_END = os.getenv('BUY_TIME_END', '15:20')  # 종가 베팅 마감
     SELL_TIME_START = os.getenv('SELL_TIME_START', '09:00')
     SELL_TIME_END = os.getenv('SELL_TIME_END', '10:00')
 
