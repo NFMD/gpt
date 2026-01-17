@@ -13,6 +13,7 @@
 - [설치 방법](#-설치-방법)
 - [설정](#-설정)
 - [사용법](#-사용법)
+- [백테스팅 및 성과 분석](#-백테스팅-및-성과-분석)
 - [매매 원칙](#-매매-원칙)
 - [주의사항](#-주의사항)
 
@@ -35,6 +36,28 @@
 - **목표 수익률**: 4.5%
 - **손절 라인**: -3%
 
+### 4. 고급 기능 (Phase 1-4)
+
+#### Phase 1: V자 반등 실시간 포착
+- **15:00-15:20 분봉 분석**: 실시간 V자 패턴 감지
+- **신호 강도 계산**: 0-100점 체계로 진입 신호 평가
+- **매수 타이밍 최적화**: 15:16-15:20 V자 확인 후 진입
+
+#### Phase 2: 익일 오전 매도 전략 고도화
+- **3분의 법칙**: 장 시작 3분 내 시초가 미돌파 시 전량 매도
+- **1분봉 20분 이평선**: EMA 이탈(-1.5%) 시 즉시 청산
+- **분할 매도**: 33%/33%/34% 3단계 익절 시스템
+
+#### Phase 3: AI 기반 의사결정 시스템
+- **200일선 상승 추세 감지**: 장기 추세 필터링
+- **켈리 공식 포지션 사이징**: 거래 실적 기반 최적 투자 비율
+- **강화학습 커맨드 센터**: Q-learning 기반 매매 의사결정
+
+#### Phase 4: 백테스팅 및 성과 분석
+- **백테스팅 엔진**: 과거 데이터 기반 전략 검증
+- **성과 분석 리포트**: 일/주/월별 상세 리포트
+- **파라미터 최적화**: Grid/Random Search 자동 최적화
+
 ---
 
 ## 📁 프로젝트 구조
@@ -49,20 +72,38 @@
 │   └── __init__.py
 ├── strategy/
 │   ├── screener.py         # 종목 스크리닝 (거래대금, 등락률)
-│   ├── technical.py        # 기술적 분석 (신고가, 이평선)
+│   ├── technical.py        # 기술적 분석 (신고가, 이평선, 200일선)
 │   ├── sector.py           # 섹터 분석
+│   ├── intraday_analysis.py # 장중 V자 반등 패턴 감지
+│   ├── morning_monitor.py  # 익일 오전 모니터링 (3분 법칙, EMA)
+│   ├── trade_history.py    # 거래 실적 추적
+│   ├── kelly_criterion.py  # 켈리 공식 포지션 사이징
+│   └── __init__.py
+├── command_center/
+│   ├── market_state.py     # 시장 상태 분석
+│   ├── rl_agent.py         # Q-learning 강화학습 에이전트
+│   ├── command_center.py   # AI 통합 의사결정
+│   └── __init__.py
+├── backtest/              # Phase 4: 백테스팅 시스템
+│   ├── backtester.py      # 백테스팅 엔진
+│   ├── performance_analyzer.py # 성과 분석기
+│   ├── optimizer.py       # 파라미터 최적화
 │   └── __init__.py
 ├── trading/
-│   ├── engine.py           # 매매 엔진
+│   ├── engine.py          # 통합 매매 엔진
 │   └── __init__.py
 ├── scheduler/
-│   ├── scheduler.py        # 자동 스케줄러
+│   ├── scheduler.py       # 자동 스케줄러
 │   └── __init__.py
-├── data/                   # 포트폴리오 데이터
-├── logs/                   # 거래 로그
-├── main.py                 # 메인 실행 파일
-├── requirements.txt        # 필요한 패키지
-├── .env.example            # 환경 변수 예시
+├── data/                  # 포트폴리오 데이터
+├── logs/                  # 거래 로그
+├── reports/               # 성과 분석 리포트
+├── backtest_results/      # 백테스트 결과
+├── optimization_results/  # 최적화 결과
+├── main.py                # 메인 실행 파일
+├── run_backtest.py        # 백테스트 실행 스크립트
+├── requirements.txt       # 필요한 패키지
+├── .env.example           # 환경 변수 예시
 └── README.md
 ```
 
@@ -184,6 +225,121 @@ python main.py --mode scheduler
 - **14:30**: 시장 스캔
 - **15:10**: 종가 베팅
 - **15:40**: 일일 마감 요약
+
+---
+
+## 🧪 백테스팅 및 성과 분석
+
+### 1. 백테스트 실행
+
+과거 데이터로 전략의 성과를 검증합니다:
+
+```bash
+python run_backtest.py --mode backtest \
+  --start 20240101 \
+  --end 20241231 \
+  --initial-capital 10000000 \
+  --min-trading-value 200000000000 \
+  --max-stocks 3 \
+  --v-threshold 70
+```
+
+**출력 예시:**
+```
+📊 백테스트 결과 요약
+==========================================
+📅 기간: 20240101 ~ 20241231
+💰 초기 자본: 10,000,000원
+💵 최종 자본: 12,450,000원
+📈 총 수익률: +24.50%
+📉 최대 낙폭 (MDD): 8.32%
+📊 샤프 비율: 1.85
+
+🎯 총 거래 횟수: 156회
+✅ 수익 거래: 98회
+❌ 손실 거래: 58회
+🎲 승률: 62.82%
+
+📊 평균 수익률: +1.87%
+📈 평균 수익 (승): +3.24%
+📉 평균 손실 (패): -1.52%
+```
+
+### 2. 파라미터 최적화
+
+Grid Search로 최적의 파라미터를 찾습니다:
+
+```bash
+python run_backtest.py --mode optimize \
+  --start 20240101 \
+  --end 20241231 \
+  --optimization-method grid \
+  --metric total_return
+```
+
+Random Search 사용 (더 빠름):
+
+```bash
+python run_backtest.py --mode optimize \
+  --start 20240101 \
+  --end 20241231 \
+  --optimization-method random \
+  --n-iterations 50 \
+  --metric sharpe_ratio
+```
+
+**최적화 메트릭:**
+- `total_return`: 총 수익률 (기본값)
+- `sharpe_ratio`: 샤프 비율 (위험 대비 수익)
+- `win_rate`: 승률
+
+### 3. 성과 분석 리포트
+
+#### 일일 리포트
+```bash
+python run_backtest.py --mode report \
+  --report-type daily \
+  --date 2024-12-01
+```
+
+#### 주간 리포트
+```bash
+python run_backtest.py --mode report \
+  --report-type weekly \
+  --weeks-back 1  # 1=지난주, 2=2주 전
+```
+
+#### 월간 리포트
+```bash
+python run_backtest.py --mode report \
+  --report-type monthly \
+  --month 2024-12
+```
+
+#### 사용자 정의 기간 리포트
+```bash
+python run_backtest.py --mode report \
+  --report-type custom \
+  --start 2024-11-01 \
+  --end 2024-12-31
+```
+
+**리포트 내용:**
+- 총 거래 횟수 및 수익
+- 승률 및 평균 수익률
+- 최고/최저 수익 거래
+- 종목별 통계
+- 연속 승/패 분석
+
+### 4. 백테스팅 결과 분석
+
+백테스트 결과는 다음 위치에 저장됩니다:
+
+- **백테스트 결과**: `backtest_results/backtest_YYYYMMDD_HHMMSS.json`
+- **최적화 결과**: `optimization_results/grid_search_YYYYMMDD_HHMMSS.json`
+- **성과 리포트**: `reports/monthly_YYYYMM.json`
+
+JSON 파일을 열어 상세한 거래 내역과 통계를 확인할 수 있습니다.
 
 ---
 
