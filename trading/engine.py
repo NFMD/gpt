@@ -15,7 +15,8 @@ from strategy import (
     TradeHistory,
     KellyCriterion,
     IntradayAnalyzer,
-    MorningMonitor
+    MorningMonitor,
+    AfterHoursMonitor
 )
 from command_center import CommandCenter
 from config import Config
@@ -34,11 +35,14 @@ class TradingEngine:
         self.technical_analyzer = TechnicalAnalyzer(api)
         self.sector_analyzer = SectorAnalyzer()
 
-        # 장중 실시간 분석 (V자 반등 포착)
+        # 장중 실시간 분석 (V자 반등 포착 + 수급 전환)
         self.intraday_analyzer = IntradayAnalyzer(api)
 
         # 익일 오전 모니터링 (3분의 법칙, 이평선 추적)
         self.morning_monitor = MorningMonitor(api)
+
+        # 시간외 리스크 모니터링 (15:50-18:00)
+        self.after_hours_monitor = AfterHoursMonitor(api)
 
         # 거래 실적 추적 및 켈리 공식
         self.trade_history = TradeHistory()
@@ -521,3 +525,94 @@ class TradingEngine:
                 f"💵 현재 평가액: {total_value:,}원\n"
                 f"📈 총 수익: {total_value - total_investment:,}원 ({total_profit_rate:+.2f}%)"
             )
+
+    def monitor_after_hours(self):
+        """
+        시간외 거래 모니터링
+
+        15:50-15:59: 장 마감 직후 리스크 체크
+        16:00-18:00: 시간외 단일가 모니터링
+
+        자동으로 시간대에 맞는 모니터링 실행
+        """
+        current_time = datetime.now().strftime("%H:%M")
+
+        # 보유 종목 확인
+        if not self.portfolio.get("holdings"):
+            logger.info("⏰ 시간외 모니터링: 보유 종목 없음")
+            return
+
+        logger.info("=" * 60)
+        logger.info(f"🔍 시간외 거래 모니터링 시작 (현재: {current_time})")
+        logger.info("=" * 60)
+
+        # 모니터링 대상 등록
+        for holding in self.portfolio["holdings"]:
+            self.after_hours_monitor.add_monitored_stock(
+                stock_code=holding["stock_code"],
+                stock_name=holding["stock_name"],
+                buy_price=holding["buy_price"],
+                buy_quantity=holding["quantity"]
+            )
+
+        # 전체 종목 모니터링 실행
+        results = self.after_hours_monitor.monitor_all_holdings()
+
+        # 리스크 대응
+        for result in results:
+            action = result.get("action_required")
+
+            if not action:
+                continue
+
+            stock_code = result["stock_code"]
+            quantity = result.get("buy_quantity", 0)
+
+            # 자동 대응 (Config.TRADING_ENABLED가 True일 때만)
+            if Config.TRADING_ENABLED:
+                logger.warning(f"🚨 자동 리스크 대응 실행: {action}")
+                success = self.after_hours_monitor.execute_risk_action(
+                    stock_code, action, quantity
+                )
+
+                if success:
+                    logger.info(f"✅ 리스크 대응 완료: {stock_code}")
+                    self._log_trade(
+                        f"시간외 {action}: {stock_code} {result.get('action_reason', '')}"
+                    )
+
+                    # 포트폴리오 업데이트
+                    if action in ["부분_매도", "부분_익절"]:
+                        sell_ratio = 0.5 if action == "부분_매도" else 0.7
+                        self._update_holding_quantity(stock_code, quantity, sell_ratio)
+                    elif action == "손절":
+                        self._remove_holding(stock_code)
+
+            else:
+                logger.warning(
+                    f"⚠️  리스크 대응 필요 (모의거래 모드): {result.get('action_reason', '')}"
+                )
+
+        logger.info("=" * 60)
+        logger.info("✅ 시간외 모니터링 완료")
+        logger.info("=" * 60)
+
+    def _update_holding_quantity(self, stock_code: str, current_quantity: int, sell_ratio: float):
+        """보유 수량 업데이트 (분할 매도)"""
+        for holding in self.portfolio["holdings"]:
+            if holding["stock_code"] == stock_code:
+                sell_quantity = int(current_quantity * sell_ratio)
+                remaining = current_quantity - sell_quantity
+                holding["quantity"] = remaining
+                logger.info(f"📊 포트폴리오 업데이트: {stock_code} {remaining}주 보유")
+                self._save_portfolio()
+                break
+
+    def _remove_holding(self, stock_code: str):
+        """보유 종목 제거 (전량 매도)"""
+        self.portfolio["holdings"] = [
+            h for h in self.portfolio["holdings"]
+            if h["stock_code"] != stock_code
+        ]
+        logger.info(f"📊 포트폴리오에서 제거: {stock_code}")
+        self._save_portfolio()

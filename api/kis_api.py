@@ -406,3 +406,203 @@ class KISApi:
         except Exception as e:
             logger.error(f"❌ 잔고 조회 오류: {e}")
             return {"holdings": [], "cash": 0}
+
+    def get_order_book(self, stock_code: str) -> Optional[Dict]:
+        """
+        호가창 데이터 조회 (매수/매도 잔량)
+
+        Args:
+            stock_code: 종목코드
+
+        Returns:
+            호가창 정보 딕셔너리
+        """
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+        headers = self._get_headers("FHKST01010200")
+        params = {
+            "fid_cond_mrkt_div_code": "J",
+            "fid_input_iscd": stock_code,
+        }
+
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            if data["rt_cd"] == "0":
+                output = data["output1"]
+
+                # 매도 호가 (10단계)
+                sell_orders = []
+                for i in range(1, 11):
+                    price = int(output.get(f"askp{i}", 0))
+                    quantity = int(output.get(f"askp_rsqn{i}", 0))
+                    if price > 0:
+                        sell_orders.append({"price": price, "quantity": quantity})
+
+                # 매수 호가 (10단계)
+                buy_orders = []
+                for i in range(1, 11):
+                    price = int(output.get(f"bidp{i}", 0))
+                    quantity = int(output.get(f"bidp_rsqn{i}", 0))
+                    if price > 0:
+                        buy_orders.append({"price": price, "quantity": quantity})
+
+                # 총 잔량 계산
+                total_sell_quantity = sum(order["quantity"] for order in sell_orders)
+                total_buy_quantity = sum(order["quantity"] for order in buy_orders)
+
+                # 체결 강도 계산 (매수 체결량 / 매도 체결량 * 100)
+                # output2에서 체결 데이터 추출
+                output2 = data.get("output2", {})
+                buy_execution = int(output2.get("antc_cnpr", 0))  # 매수 체결량
+                sell_execution = int(output2.get("antc_cnqn", 0))  # 매도 체결량
+
+                execution_strength = 0.0
+                if sell_execution > 0:
+                    execution_strength = (buy_execution / sell_execution) * 100
+
+                return {
+                    "stock_code": stock_code,
+                    "sell_orders": sell_orders,
+                    "buy_orders": buy_orders,
+                    "total_sell_quantity": total_sell_quantity,
+                    "total_buy_quantity": total_buy_quantity,
+                    "sell_buy_ratio": total_sell_quantity / total_buy_quantity if total_buy_quantity > 0 else 0,
+                    "execution_strength": execution_strength,
+                    "best_sell_price": sell_orders[0]["price"] if sell_orders else 0,
+                    "best_buy_price": buy_orders[0]["price"] if buy_orders else 0,
+                }
+            else:
+                logger.warning(f"⚠️  호가창 조회 실패: {data.get('msg1', 'Unknown error')}")
+                return None
+
+        except Exception as e:
+            logger.error(f"❌ 호가창 조회 오류 ({stock_code}): {e}")
+            return None
+
+    def get_execution_strength(self, stock_code: str) -> Optional[float]:
+        """
+        체결 강도 조회
+
+        체결 강도 = (매수 체결량 / 매도 체결량) * 100
+        - 100 초과: 매수세 우세
+        - 100 미만: 매도세 우세
+        - 150 이상: 강력한 매수세 (진입 신호)
+
+        Args:
+            stock_code: 종목코드
+
+        Returns:
+            체결 강도 (%)
+        """
+        order_book = self.get_order_book(stock_code)
+
+        if order_book:
+            return order_book["execution_strength"]
+
+        return None
+
+    def get_program_trading(self, stock_code: str) -> Optional[Dict]:
+        """
+        프로그램 매매 추이 조회
+
+        외국인 프로그램 매매의 순매수/순매도 추이를 확인하여
+        수급 전환 시점을 포착합니다.
+
+        Args:
+            stock_code: 종목코드
+
+        Returns:
+            프로그램 매매 정보
+        """
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+        headers = self._get_headers("FHKST03010100")
+        params = {
+            "fid_cond_mrkt_div_code": "J",
+            "fid_input_iscd": stock_code,
+            "fid_input_date_1": (datetime.now() - timedelta(days=7)).strftime("%Y%m%d"),
+            "fid_input_date_2": datetime.now().strftime("%Y%m%d"),
+            "fid_period_div_code": "D",
+            "fid_org_adj_prc": "0",
+        }
+
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+
+            if data["rt_cd"] == "0" and len(data["output2"]) > 0:
+                # 최근 데이터 (오늘)
+                today_data = data["output2"][0]
+
+                # 프로그램 순매수량 (외국인 프로그램)
+                program_net_buy = int(today_data.get("prdy_vrss_sign", 0))  # 전일 대비 부호
+                program_volume = int(today_data.get("acml_vol", 0))  # 누적 거래량
+
+                # 최근 3일간 추이
+                recent_trend = []
+                for item in data["output2"][:3]:
+                    recent_trend.append({
+                        "date": item.get("stck_bsop_date", ""),
+                        "net_buy": int(item.get("prdy_vrss_sign", 0)),
+                        "volume": int(item.get("acml_vol", 0)),
+                    })
+
+                # 수급 전환 감지 (음수 → 양수)
+                supply_reversal = False
+                if len(recent_trend) >= 2:
+                    if recent_trend[0]["net_buy"] > 0 and recent_trend[1]["net_buy"] < 0:
+                        supply_reversal = True
+
+                return {
+                    "stock_code": stock_code,
+                    "program_net_buy": program_net_buy,
+                    "program_volume": program_volume,
+                    "recent_trend": recent_trend,
+                    "supply_reversal": supply_reversal,
+                }
+            else:
+                logger.debug(f"⚠️  프로그램 매매 조회 실패: {data.get('msg1', 'No data')}")
+                return None
+
+        except Exception as e:
+            logger.error(f"❌ 프로그램 매매 조회 오류 ({stock_code}): {e}")
+            return None
+
+    def get_after_hours_order_book(self, stock_code: str) -> Optional[Dict]:
+        """
+        시간외 호가창 조회 (15:30-16:00, 시간외 단일가)
+
+        15:50-15:59 구간의 매도 잔량 급증을 감지하여
+        익일 갭 하락 리스크를 사전 차단합니다.
+
+        Args:
+            stock_code: 종목코드
+
+        Returns:
+            시간외 호가창 정보
+        """
+        # 시간외 단일가는 일반 호가창 API와 동일하지만 시간대를 체크
+        current_time = datetime.now().strftime("%H:%M")
+
+        # 15:30-18:00 구간만 유효
+        if current_time < "15:30" or current_time > "18:00":
+            logger.debug(f"⚠️  시간외 거래 시간이 아닙니다 (현재: {current_time})")
+            return None
+
+        # 일반 호가창 API 사용
+        order_book = self.get_order_book(stock_code)
+
+        if order_book:
+            # 시간외 거래 구간임을 표시
+            order_book["is_after_hours"] = True
+            order_book["check_time"] = current_time
+
+            # 위험 신호: 매도 잔량이 매수 잔량의 2배 이상
+            risk_signal = order_book["sell_buy_ratio"] >= 2.0
+            order_book["risk_signal"] = risk_signal
+
+            return order_book
+
+        return None

@@ -5,6 +5,9 @@ from .trade_history import TradeHistory
 from .kelly_criterion import KellyCriterion
 from .intraday_analysis import IntradayAnalyzer
 from .morning_monitor import MorningMonitor
+from .execution_monitor import ExecutionMonitor
+from .order_book_analyzer import OrderBookAnalyzer
+from .after_hours_monitor import AfterHoursMonitor
 
 __all__ = [
     'StockScreener',
@@ -13,5 +16,8 @@ __all__ = [
     'TradeHistory',
     'KellyCriterion',
     'IntradayAnalyzer',
-    'MorningMonitor'
+    'MorningMonitor',
+    'ExecutionMonitor',
+    'OrderBookAnalyzer',
+    'AfterHoursMonitor'
 ]

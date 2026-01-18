@@ -1,12 +1,20 @@
 """
 장중 분봉 분석 모듈
 15:00-15:20 구간에서 V자 반등 패턴을 포착하고 최적 진입 타점을 찾습니다.
+
+업그레이드:
+- 15:16-15:20 시간 필터 적용
+- 체결 강도 및 프로그램 매매 수급 전환 감지
+- 호가창 역설 지표 통합
 """
 import logging
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 import numpy as np
 from api import KISApi
+from strategy.execution_monitor import ExecutionMonitor
+from strategy.order_book_analyzer import OrderBookAnalyzer
+from config import Config
 
 
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +26,8 @@ class IntradayAnalyzer:
 
     def __init__(self, api: KISApi):
         self.api = api
+        self.execution_monitor = ExecutionMonitor(api)
+        self.order_book_analyzer = OrderBookAnalyzer(api)
 
     def get_closing_period_data(
         self,
@@ -231,9 +241,12 @@ class IntradayAnalyzer:
         stock_name: str = ""
     ) -> Optional[Dict]:
         """
-        최적 진입 신호 생성
+        최적 진입 신호 생성 (업그레이드)
 
-        15:00-15:20 구간에서 V자 반등 + 매수세 확인 시 진입 신호
+        15:16-15:20 구간에서:
+        - V자 반등 + 매수세 확인
+        - 체결 강도 150% 이상 + 프로그램 매매 전환
+        - 호가창 역설 (매도 잔량 우세 + 가격 상승)
 
         Args:
             stock_code: 종목코드
@@ -242,7 +255,21 @@ class IntradayAnalyzer:
         Returns:
             진입 신호 정보 또는 None
         """
-        logger.info(f"🔍 {stock_name} ({stock_code}) 장중 분석 중...")
+        current_time = datetime.now().strftime("%H:%M")
+
+        # 시간 필터: 15:16 이전에는 분석만, 15:20 이후는 마감
+        if current_time < "15:16":
+            logger.info(f"⏰ {stock_name}: 진입 시간 전 (현재: {current_time}, 진입: 15:16 이후)")
+            return None
+
+        if current_time > "15:20":
+            logger.info(f"⏰ {stock_name}: 진입 시간 마감 (현재: {current_time})")
+            return None
+
+        logger.info("=" * 60)
+        logger.info(f"🔍 {stock_name} ({stock_code}) 종합 분석 중...")
+        logger.info(f"⏰ 현재 시각: {current_time}")
+        logger.info("=" * 60)
 
         # 1. 분봉 데이터 조회
         minute_data = self.get_closing_period_data(stock_code, interval=1)
@@ -259,41 +286,97 @@ class IntradayAnalyzer:
         # 4. 매수세 분석
         buying_analysis = self.analyze_buying_pressure(minute_data)
 
-        # 5. 종합 판단
-        signal_strength = 0
+        # 5. 수급 역전 신호 (체결 강도 + 프로그램 매매)
+        supply_signal = self.execution_monitor.get_supply_reversal_signal(
+            stock_code, stock_name
+        )
 
+        # 6. 호가창 역설 신호
+        paradox_signal = self.order_book_analyzer.check_paradox_signal(
+            stock_code, stock_name, min_ratio=2.0
+        )
+
+        # 7. 종합 판단
+        signal_strength = 0
+        entry_reasons = []
+
+        # V자 반등 (최대 80점)
         if v_pattern:
             signal_strength += 50  # V자 반등 확인
             signal_strength += min(v_pattern['pattern_strength'], 30)  # 패턴 강도
+            entry_reasons.append(f"V자 반등 (하락 {v_pattern['drop_percent']:.1f}% → 반등 {v_pattern['rebound_percent']:.1f}%)")
 
+        # 매수세 (최대 40점)
         if buying_analysis['buying_pressure'] >= 60:
             signal_strength += 20  # 매수세 강함
+            entry_reasons.append(f"매수세 강함 ({buying_analysis['buying_pressure']:.0f}%)")
 
         if buying_analysis['volume_surge']:
             signal_strength += 10  # 거래량 급증
+            entry_reasons.append("거래량 급증")
 
         if buying_analysis['price_support']:
             signal_strength += 10  # 저점 지지
+            entry_reasons.append("저점 지지")
 
+        # 수급 역전 신호 (최대 100점) - 핵심!
+        if supply_signal and supply_signal.get("entry_signal", False):
+            signal_strength += supply_signal.get("total_signal_strength", 0)
+            entry_reasons.append(f"수급 역전 (체결 강도 {supply_signal['execution_strength']:.0f}%)")
+
+            if supply_signal.get("supply_reversal", False):
+                entry_reasons.append("프로그램 매매 전환 (매도→매수)")
+
+        # 호가창 역설 (최대 80점)
+        if paradox_signal and paradox_signal.get("paradox_detected", False):
+            paradox_strength = paradox_signal.get("signal_strength", 0)
+            signal_strength += paradox_strength
+            entry_reasons.append(
+                f"호가창 역설 (매도/매수 {paradox_signal['sell_buy_ratio']:.1f}:1, "
+                f"가격 {'상승' if paradox_signal['price_rising'] else '안정'})"
+            )
+
+        # 모멘텀 (최대 10점)
         if momentum > 20:
             signal_strength += 10  # 양의 모멘텀
+            entry_reasons.append(f"양의 모멘텀 ({momentum:.1f})")
 
-        # 6. 진입 신호 생성 (70점 이상)
-        if signal_strength >= 70:
+        # 8. 최종 진입 판단 (80점 이상으로 상향)
+        threshold = getattr(Config, 'ENTRY_SIGNAL_THRESHOLD', 80)
+
+        if signal_strength >= threshold:
             current_price = minute_data[0]['close']
 
             logger.info("=" * 60)
-            logger.info(f"🎯 진입 신호 발생! ({stock_name})")
+            logger.info(f"🚀 강력한 진입 신호 발생! ({stock_name})")
             logger.info("=" * 60)
-            logger.info(f"신호 강도: {signal_strength}/100")
-            logger.info(f"현재가: {current_price:,}원")
+            logger.info(f"📊 총 신호 강도: {signal_strength}/100 (기준: {threshold}점)")
+            logger.info(f"💰 권장 진입가: {current_price:,}원")
+            logger.info("")
+            logger.info("📋 진입 근거:")
+            for idx, reason in enumerate(entry_reasons, 1):
+                logger.info(f"   {idx}. {reason}")
+            logger.info("=" * 60)
+
+            # 상세 정보 로깅
             if v_pattern:
                 logger.info(
-                    f"V자 반등: {v_pattern['low_price']:,}원 → {current_price:,}원 "
+                    f"   [V자 반등] {v_pattern['low_price']:,}원 → {current_price:,}원 "
                     f"(+{v_pattern['rebound_percent']:.2f}%)"
                 )
-            logger.info(f"모멘텀: {momentum:.1f}")
-            logger.info(f"매수세: {buying_analysis['buying_pressure']:.0f}%")
+
+            if supply_signal:
+                logger.info(
+                    f"   [수급] 체결 강도 {supply_signal['execution_strength']:.0f}%, "
+                    f"프로그램 순매수 {supply_signal.get('program_net_buy', 0):,}주"
+                )
+
+            if paradox_signal:
+                logger.info(
+                    f"   [호가창] 매도 잔량 {paradox_signal['total_sell_quantity']:,}주 vs "
+                    f"매수 잔량 {paradox_signal['total_buy_quantity']:,}주"
+                )
+
             logger.info("=" * 60)
 
             return {
@@ -301,13 +384,18 @@ class IntradayAnalyzer:
                 "stock_name": stock_name,
                 "signal_strength": signal_strength,
                 "entry_price": current_price,
+                "entry_reasons": entry_reasons,
                 "v_pattern": v_pattern,
                 "momentum": momentum,
                 "buying_analysis": buying_analysis,
+                "supply_signal": supply_signal,
+                "paradox_signal": paradox_signal,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
         else:
             logger.info(
-                f"⏸️  {stock_name}: 진입 조건 미달 (신호 강도: {signal_strength}/100)"
+                f"⏸️  {stock_name}: 진입 조건 미달 (신호 강도: {signal_strength}/{threshold}점)"
             )
+            if entry_reasons:
+                logger.info(f"   감지된 신호: {', '.join(entry_reasons)}")
             return None

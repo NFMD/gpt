@@ -40,9 +40,23 @@ class Config:
     SELL_TIME_START = os.getenv('SELL_TIME_START', '09:00')
     SELL_TIME_END = os.getenv('SELL_TIME_END', '10:00')
 
+    # 시간외 거래 설정
+    AFTER_HOURS_RISK_CHECK_START = os.getenv('AFTER_HOURS_RISK_CHECK_START', '15:50')  # 장 마감 리스크 체크
+    AFTER_HOURS_RISK_CHECK_END = os.getenv('AFTER_HOURS_RISK_CHECK_END', '15:59')
+    AFTER_HOURS_TRADING_START = os.getenv('AFTER_HOURS_TRADING_START', '16:00')  # 시간외 단일가
+    AFTER_HOURS_TRADING_END = os.getenv('AFTER_HOURS_TRADING_END', '18:00')
+
     # 수익률 설정
     TARGET_PROFIT_RATE = float(os.getenv('TARGET_PROFIT_RATE', 0.045))  # 4.5%
     STOP_LOSS_RATE = float(os.getenv('STOP_LOSS_RATE', -0.03))  # -3%
+    AFTER_HOURS_PROFIT_TARGET = float(os.getenv('AFTER_HOURS_PROFIT_TARGET', 0.04))  # 시간외 +4% 익절
+    AFTER_HOURS_STOP_LOSS = float(os.getenv('AFTER_HOURS_STOP_LOSS', -0.02))  # 시간외 -2% 손절
+
+    # 진입 신호 설정 (업그레이드)
+    ENTRY_SIGNAL_THRESHOLD = int(os.getenv('ENTRY_SIGNAL_THRESHOLD', 80))  # 진입 신호 최소 점수
+    EXECUTION_STRENGTH_MIN = int(os.getenv('EXECUTION_STRENGTH_MIN', 100))  # 체결 강도 최소 기준
+    EXECUTION_STRENGTH_STRONG = int(os.getenv('EXECUTION_STRENGTH_STRONG', 150))  # 강력한 체결 강도
+    ORDER_BOOK_PARADOX_RATIO = float(os.getenv('ORDER_BOOK_PARADOX_RATIO', 2.0))  # 호가창 역설 비율
 
     # API URL
     KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
