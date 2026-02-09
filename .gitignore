@@ -37,7 +37,9 @@ env/
 *~
 
 # Data & Logs
-data/
+data/*.json
+data/*.db
+data/q_table.json
 logs/
 *.log
 
