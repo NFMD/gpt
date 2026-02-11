@@ -1,5 +1,5 @@
 """
-설정 관리 모듈 (v2.0)
+설정 관리 모듈 (v2.0 — Part 3 통합)
 환경 변수와 설정값을 로드하고 관리합니다.
 
 v2.0 변경사항:
@@ -9,6 +9,10 @@ v2.0 변경사항:
 - 뉴스 확산성 기준 추가
 - 장후 데이터 수집 시간 설정 추가
 - AI 활성화 시간 설정 추가
+- Part 3: 리스크 관리 5대 영역 설정 추가
+- Part 3: 뇌동매매 방지 가드 설정 추가
+- Part 3: Discord 알림 채널 설정 추가
+- Part 3: 수익금 인출 규칙 추가
 """
 import os
 from dotenv import load_dotenv
@@ -124,6 +128,31 @@ class Config:
     TARGET_SHARPE_RATIO = 1.5           # 목표 샤프 비율
     TARGET_DAILY_RETURN = 0.003         # 일평균 수익률 0.3%
     TARGET_TRADE_FREQ = (1, 3)          # 일 거래 빈도 (최소, 최대)
+
+    # ── Part 3: 손절 엔진 설정 ──
+    STOP_LOSS_TIME_3MIN = "09:03:00"       # 3분 시간 손절 시각
+    STOP_LOSS_TIMEOUT = "10:00:00"         # 10시 강제 청산 시각
+
+    # ── Part 3: 뇌동매매 방지 가드 ──
+    MAX_DAILY_ENTRIES = 3                  # 일일 최대 진입 횟수
+    MAX_CONSECUTIVE_LOSSES = 3             # 연속 손실 허용 횟수
+    MAX_DAILY_LOSS_PCT = -5.0              # 일일 최대 손실 (%)
+
+    # ── Part 3: 수익금 인출 ──
+    WITHDRAWAL_FREQUENCY = "weekly"        # 인출 주기
+    WITHDRAWAL_PCT = 0.20                  # 주간 수익의 20% 인출
+    WITHDRAWAL_MIN_AMOUNT = 100_000        # 최소 인출 금액
+
+    # ── Part 3: Discord 웹훅 ──
+    DISCORD_WEBHOOK_TRADING = os.getenv('DISCORD_WEBHOOK_TRADING', '')
+    DISCORD_WEBHOOK_V_PATTERN = os.getenv('DISCORD_WEBHOOK_V_PATTERN', '')
+    DISCORD_WEBHOOK_DAILY_REPORT = os.getenv('DISCORD_WEBHOOK_DAILY_REPORT', '')
+    DISCORD_WEBHOOK_RISK = os.getenv('DISCORD_WEBHOOK_RISK', '')
+    DISCORD_WEBHOOK_AFTER_HOURS = os.getenv('DISCORD_WEBHOOK_AFTER_HOURS', '')
+    DISCORD_WEBHOOK_SYSTEM = os.getenv('DISCORD_WEBHOOK_SYSTEM', '')
+
+    # ── Part 3: AI 호출 비용 추적 ──
+    DAILY_AI_COST_ESTIMATE = 3.02          # 일일 예상 AI 비용 (USD)
 
     # ── API URL ──
     KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
