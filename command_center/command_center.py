@@ -3,11 +3,11 @@
 Claude Opus(Commander) 역할을 수행하며 다른 AI들의 분석을 종합합니다.
 
 v2.0 변경사항:
-- 4가지 수익원천 로직 앙상블 점수 기반 의사결정
-- 거시 환경 필터(MarketRegime) 통합
+- 5단계 전략 파이프라인 연동
+- calculate_logic_scores 기반 4로직 앙상블 의사결정
+- determine_entry_weight 기반 포지션 사이징
 - VETO 시스템 통합
 - COMMANDER 입출력 포맷 표준화
-- 포지션 사이징에 레짐 배수 반영
 """
 import logging
 from typing import Dict, List, Optional
@@ -19,6 +19,7 @@ from strategy.veto import VetoScanner
 from strategy.tug_of_war import TugOfWarAnalyzer
 from strategy.moc_imbalance import MOCImbalanceAnalyzer
 from strategy.news_analyzer import NewsTemporalAnalyzer
+from strategy.intraday_analysis import calculate_logic_scores, determine_entry_weight
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,13 +49,13 @@ class CommandCenter:
         account_info: Dict,
     ) -> List[Dict]:
         """
-        COMMANDER -- 최종 의사결정 (v2.0)
+        COMMANDER — 최종 의사결정 (v2.0)
 
         1. 거시 환경 필터 적용
         2. VETO 스캔
-        3. 4가지 로직별 점수 산출
+        3. 4가지 로직별 점수 산출 (calculate_logic_scores)
         4. 앙상블 종합 점수 기반 순위화
-        5. 포지션 사이징 (레짐 배수 반영)
+        5. 포지션 사이징 (determine_entry_weight)
         """
         logger.info("=" * 60)
         logger.info("[COMMANDER] 최종 의사결정 시작 (v2.0 앙상블)")
@@ -69,12 +70,10 @@ class CommandCenter:
         )
 
         if regime == MarketRegime.DANGER:
-            logger.warning("[COMMANDER] DANGER 레짐 -- 신규 진입 전면 금지")
+            logger.warning("[COMMANDER] DANGER 레짐 — 신규 진입 전면 금지")
             return []
 
-        regime_multiplier = self.macro_filter.get_position_multiplier()
-
-        # 2. VETO 스캔 + 3. 로직별 점수 산출 + 4. 앙상블
+        # 2~4. VETO → 로직 점수 → 앙상블
         ensemble_results: List[EnsembleResult] = []
 
         for stock in candidates:
@@ -85,13 +84,12 @@ class CommandCenter:
             news_items = stock.get("news_items", [])
             veto_result = self.veto_scanner.scan_news_list(symbol, name, news_items)
             if veto_result.is_vetoed:
-                logger.warning(f"[COMMANDER] {name} VETO 발동 -- 즉시 제외")
+                logger.warning(f"[COMMANDER] {name} VETO 발동 — 즉시 제외")
                 continue
 
             # LOGIC 1: Tug of War
             tow_result = self.tow_analyzer.calculate_score(
-                symbol=symbol,
-                name=name,
+                symbol=symbol, name=name,
                 open_price=stock.get("open_price", 0),
                 current_price=stock.get("current_price", 0),
                 close_price_yesterday=stock.get("close_price_yesterday", 0),
@@ -105,14 +103,13 @@ class CommandCenter:
                 trading_value=stock.get("trading_value", 0),
             )
 
-            # LOGIC 2: V자 수급전환 (기존 phase3_score 활용 -> 100점 스케일링)
-            raw_v_score = stock.get("phase3_score", 0)
-            logic2_score = min(100, raw_v_score * 100 / 75) if raw_v_score > 0 else 0
+            # V자 점수 → LOGIC 2 환산
+            raw_v_score = stock.get("phase3_score", stock.get("v_score", 0))
+            logic2_v = min(100, int(raw_v_score / 75 * 100)) if raw_v_score > 0 else 0
 
             # LOGIC 3: MOC Imbalance
             moc_result = self.moc_analyzer.calculate_score(
-                symbol=symbol,
-                name=name,
+                symbol=symbol, name=name,
                 sell_order_qty=stock.get("sell_order_qty", 0),
                 buy_order_qty=stock.get("buy_order_qty", 0),
                 current_price=stock.get("current_price", 0),
@@ -126,8 +123,7 @@ class CommandCenter:
             headlines = [item.get("title", "") for item in news_items]
             sentiment = self.news_analyzer.analyze_headlines_sentiment(headlines)
             news_result = self.news_analyzer.calculate_score(
-                symbol=symbol,
-                name=name,
+                symbol=symbol, name=name,
                 google_news_count=stock.get("google_news_count", 0),
                 naver_news_count=stock.get("naver_news_count", 0),
                 news_headlines=headlines,
@@ -139,10 +135,9 @@ class CommandCenter:
 
             # 앙상블 점수 산출
             ensemble = self.ensemble_scorer.score_candidate(
-                symbol=symbol,
-                name=name,
+                symbol=symbol, name=name,
                 logic1_score=tow_result.score,
-                logic2_score=logic2_score,
+                logic2_score=logic2_v,
                 logic3_score=moc_result.score,
                 logic4_score=news_result.score,
                 logic_details={
@@ -159,6 +154,7 @@ class CommandCenter:
         # 5. 최종 의사결정
         decisions = []
         for result in ranked[:Config.MAX_STOCKS]:
+            regime_multiplier = self.macro_filter.get_position_multiplier()
             adjusted_multiplier = result.position_multiplier * regime_multiplier
 
             if adjusted_multiplier <= 0:
@@ -206,14 +202,11 @@ class CommandCenter:
     def _build_reasoning(self, result: EnsembleResult, regime: MarketRegime) -> str:
         """의사결정 근거 문자열 생성"""
         parts = [f"앙상블 {result.ensemble_score:.1f}점({result.entry_tier})"]
-
         for ls in result.logic_scores:
             if ls.score > 0:
                 parts.append(f"{ls.logic_name} {ls.score:.0f}")
-
         parts.append(f"주도로직={result.dominant_logic}")
         parts.append(f"레짐={regime.value}")
-
         return " | ".join(parts)
 
     def get_macro_status(self) -> Dict:

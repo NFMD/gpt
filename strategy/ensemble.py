@@ -6,29 +6,30 @@ LOGIC 1: Tug of War (투자자 이질성) — 30%
 LOGIC 2: V자 수급전환 (실시간 프로그램 매매) — 35%
 LOGIC 3: MOC Imbalance (체결 메커니즘 왜곡) — 15%
 LOGIC 4: 뉴스 Temporal Anomaly (정보 전파 속도 차이) — 20%
+
+v2.0 변경사항:
+- calculate_logic_scores 연동 (intraday_analysis에서 로직별 점수 산출)
+- determine_entry_weight 연동 (진입 비중 결정)
+- EnsembleScorer.score_with_logic_dict: 로직별 점수 직접 수용
 """
 import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+from config import Config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 # ── 앙상블 가중치 ──
-ENSEMBLE_WEIGHTS = {
-    "tug_of_war": 0.30,
-    "v_pattern": 0.35,
-    "moc_imbalance": 0.15,
-    "news_temporal": 0.20,
-}
+ENSEMBLE_WEIGHTS = Config.ENSEMBLE_WEIGHTS
 
 # ── 진입 기준 ──
 ENTRY_THRESHOLDS = {
-    "priority": 70,     # 최우선 진입 (비중 확대)
-    "standard": 55,     # 표준 진입
-    "small": 40,        # 소규모 진입 (비중 축소)
-    "skip": 40,         # 이 미만은 SKIP
+    "priority": Config.ENSEMBLE_PRIORITY_THRESHOLD,   # 70
+    "standard": Config.ENSEMBLE_STANDARD_THRESHOLD,    # 55
+    "small": Config.ENSEMBLE_SMALL_THRESHOLD,          # 40
+    "skip": Config.ENSEMBLE_SMALL_THRESHOLD,           # 40 미만 SKIP
 }
 
 
@@ -55,23 +56,12 @@ class EnsembleResult:
 
 
 def calculate_ensemble_score(
-    logic1_score: float,  # Tug of War (0~100)
-    logic2_score: float,  # V자 수급전환 (0~100)
-    logic3_score: float,  # MOC Imbalance (0~100)
-    logic4_score: float,  # 뉴스 Temporal (0~100)
+    logic1_score: float,
+    logic2_score: float,
+    logic3_score: float,
+    logic4_score: float,
 ) -> float:
-    """
-    4가지 로직의 앙상블 점수 산출
-
-    Args:
-        logic1_score: Tug of War 점수 (0~100)
-        logic2_score: V자 수급전환 점수 (0~100)
-        logic3_score: MOC Imbalance 점수 (0~100)
-        logic4_score: 뉴스 Temporal Anomaly 점수 (0~100)
-
-    Returns:
-        앙상블 종합 점수 (0~100)
-    """
+    """4가지 로직의 앙상블 점수 산출"""
     ensemble = (
         logic1_score * ENSEMBLE_WEIGHTS["tug_of_war"]
         + logic2_score * ENSEMBLE_WEIGHTS["v_pattern"]
@@ -82,15 +72,7 @@ def calculate_ensemble_score(
 
 
 def determine_entry_tier(ensemble_score: float) -> Tuple[str, float]:
-    """
-    앙상블 점수 기반 진입 등급 결정
-
-    Args:
-        ensemble_score: 앙상블 종합 점수
-
-    Returns:
-        (진입 등급, 포지션 배수)
-    """
+    """앙상블 점수 기반 진입 등급 결정"""
     if ensemble_score >= ENTRY_THRESHOLDS["priority"]:
         return "PRIORITY", 1.5     # 비중 확대
     elif ensemble_score >= ENTRY_THRESHOLDS["standard"]:
@@ -138,21 +120,7 @@ class EnsembleScorer:
         logic4_score: float,
         logic_details: Optional[Dict] = None,
     ) -> EnsembleResult:
-        """
-        단일 종목의 앙상블 점수 산출
-
-        Args:
-            symbol: 종목코드
-            name: 종목명
-            logic1_score: Tug of War 점수
-            logic2_score: V자 수급전환 점수
-            logic3_score: MOC Imbalance 점수
-            logic4_score: 뉴스 Temporal Anomaly 점수
-            logic_details: 로직별 상세 정보 (선택)
-
-        Returns:
-            EnsembleResult
-        """
+        """단일 종목의 앙상블 점수 산출"""
         details = logic_details or {}
 
         ensemble = calculate_ensemble_score(
@@ -196,16 +164,21 @@ class EnsembleScorer:
 
         return result
 
+    def score_with_logic_dict(
+        self, symbol: str, name: str, logic_scores_dict: dict,
+    ) -> EnsembleResult:
+        """calculate_logic_scores 결과 딕셔너리로 직접 점수 산출"""
+        return self.score_candidate(
+            symbol=symbol,
+            name=name,
+            logic1_score=logic_scores_dict["logic1_tow"],
+            logic2_score=logic_scores_dict["logic2_v"],
+            logic3_score=logic_scores_dict["logic3_moc"],
+            logic4_score=logic_scores_dict["logic4_news"],
+        )
+
     def rank_candidates(self, results: List[EnsembleResult]) -> List[EnsembleResult]:
-        """
-        앙상블 점수 기준 후보 순위화 (SKIP 제외)
-
-        Args:
-            results: EnsembleResult 리스트
-
-        Returns:
-            앙상블 점수 내림차순 정렬된 리스트 (SKIP 제외)
-        """
+        """앙상블 점수 기준 후보 순위화 (SKIP 제외)"""
         filtered = [r for r in results if r.entry_tier != "SKIP"]
         ranked = sorted(filtered, key=lambda r: r.ensemble_score, reverse=True)
 

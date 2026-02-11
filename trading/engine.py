@@ -1,14 +1,19 @@
 """
 매매 엔진 모듈 (v2.0)
-종가 베팅 전략을 실행하고 포트폴리오를 관리합니다.
+종가 베팅 5단계 전략 파이프라인을 실행하고 포트폴리오를 관리합니다.
 
 v2.0 변경사항:
-- 4가지 수익원천 앙상블 프레임워크 통합
+- 5단계 파이프라인 명시적 구현
+  PHASE 1: 유니버스 필터 (수천→~50)
+  PHASE 2: 기술적 검증 (~50→~10)
+  PHASE 3: 심리적 검증 (~10→~5, VETO 포함)
+  PHASE 4: V자 반등 + 앙상블 진입 (~5→매수)
+  PHASE 5: 익일 청산 (시나리오별 분할매도)
 - 거시 환경 필터(MarketRegime) 통합
-- VETO 시스템 통합
+- calculate_logic_scores 기반 4로직 앙상블
+- determine_entry_weight 기반 포지션 사이징
+- 장후 리스크 관리 (after_hours_risk_check)
 - SQLite DB 기반 매매 기록
-- 포지션 사이징에 레짐 배수 반영
-- 장후 잔량 모니터링 지원
 """
 import logging
 import json
@@ -18,10 +23,18 @@ from pathlib import Path
 from api import KISApi
 from strategy.screener import StockScreener
 from strategy.technical import TechnicalAnalyzer
-from strategy.intraday_analysis import IntradayAnalyzer
-from strategy.morning_monitor import MorningMonitor, ExitScenario
+from strategy.intraday_analysis import (
+    IntradayAnalyzer, calculate_logic_scores, determine_entry_weight,
+)
+from strategy.morning_monitor import (
+    MorningMonitor, ExitScenario,
+    determine_exit_scenario, execute_exit, after_hours_risk_check,
+)
+from strategy.sentiment import SentimentData, phase3_score, find_power_keywords
 from strategy.kelly_criterion import KellyCriterion
 from strategy.macro_filter import MacroFilter, MarketRegime
+from strategy.ensemble import EnsembleScorer
+from strategy.veto import VetoScanner
 from command_center.command_center import CommandCenter
 from data.database import TradingDatabase
 from config import Config
@@ -32,23 +45,30 @@ logger = logging.getLogger(__name__)
 
 
 class TradingEngine:
-    """매매 엔진 (v2.0)"""
+    """매매 엔진 (v2.0) — 5단계 전략 파이프라인"""
 
     def __init__(self, api: KISApi):
         self.api = api
-        self.screener = StockScreener(api)
-        self.technical_analyzer = TechnicalAnalyzer(api)
-        self.intraday_analyzer = IntradayAnalyzer(api)
-        self.morning_monitor = MorningMonitor(api)
+
+        # PHASE별 분석기
+        self.screener = StockScreener(api)              # PHASE 1
+        self.technical_analyzer = TechnicalAnalyzer(api)  # PHASE 2
+        self.veto_scanner = VetoScanner()                # PHASE 3 VETO
+        self.intraday_analyzer = IntradayAnalyzer(api)   # PHASE 4
+        self.morning_monitor = MorningMonitor(api)       # PHASE 5
+
+        # 공통 모듈
         self.kelly = KellyCriterion()
+        self.ensemble_scorer = EnsembleScorer()
+        self.macro_filter = MacroFilter()
         self.command_center = CommandCenter(api)
-        self.macro_filter = self.command_center.macro_filter
         self.db = TradingDatabase()
 
+        # 포트폴리오
         self.portfolio_file = Path(__file__).parent.parent / "data" / "portfolio.json"
         self.portfolio = self._load_portfolio()
 
-        logger.info("TradingEngine (v2.0) 초기화 완료")
+        logger.info("TradingEngine (v2.0) 초기화 완료 — 5단계 파이프라인")
 
     def _load_portfolio(self) -> Dict:
         if self.portfolio_file.exists():
@@ -61,24 +81,27 @@ class TradingEngine:
         with open(self.portfolio_file, 'w', encoding='utf-8') as f:
             json.dump(self.portfolio, f, ensure_ascii=False, indent=2)
 
+    # ═══════════════════════════════════════════════════════
+    # 종가 베팅 전략 (PHASE 1~4)
+    # ═══════════════════════════════════════════════════════
+
     def run_closing_strategy(self, market_condition: Optional[Dict] = None):
         """
-        종가 베팅 전략 실행 (14:30 ~ 15:20) -- v2.0
+        종가 베팅 5단계 전략 실행 (14:00~15:20)
 
-        1. 거시 환경 필터 체크
-        2. PHASE 1: 유니버스 필터
-        3. PHASE 2: 기술적 검증
-        4. PHASE 3/4: V자 반등 감지
-        5. COMMANDER 앙상블 의사결정
-        6. 주문 실행 + DB 기록
+        0. 거시 환경 필터 (DANGER = 전면 중단)
+        1. PHASE 1: 유니버스 필터 → ~50개
+        2. PHASE 2: 기술적 검증 → ~10개
+        3. PHASE 3: 심리적 검증 + VETO → ~5개
+        4. PHASE 4: V자 반등 감지 + 앙상블 진입
         """
         logger.info("=" * 60)
-        logger.info("[ENGINE] 종가 베팅 전략 실행 시작 (v2.0)")
+        logger.info("[ENGINE] 종가 베팅 5단계 파이프라인 시작 (v2.0)")
         logger.info("=" * 60)
 
         mc = market_condition or {}
 
-        # 1. 거시 환경 필터
+        # ═══ 0. 거시 환경 필터 ═══
         regime = self.macro_filter.update(
             kospi_change=mc.get("kospi_change", 0),
             kosdaq_change=mc.get("kosdaq_change", 0),
@@ -87,83 +110,150 @@ class TradingEngine:
         )
 
         if regime == MarketRegime.DANGER:
-            logger.warning("[ENGINE] DANGER 레짐 - 종가 베팅 전면 중단")
+            logger.warning("[ENGINE] DANGER 레짐 — 종가 베팅 전면 중단")
             return
 
-        # 2. PHASE 1: 유니버스 필터
+        # ═══ PHASE 1: 유니버스 필터 ═══
+        logger.info("[ENGINE] PHASE 1: 유니버스 필터")
         candidates = self.screener.get_candidates()
         if not candidates:
-            logger.info("[ENGINE] PHASE 1 통과 종목 없음")
+            logger.info("[ENGINE] PHASE 1 통과 종목 없음 — 종료")
             return
 
-        # 3. PHASE 2: 기술적 검증
+        # ═══ PHASE 2: 기술적 검증 ═══
+        logger.info("[ENGINE] PHASE 2: 기술적 검증")
         tech_passed = self.technical_analyzer.analyze_candidates(candidates)
         if not tech_passed:
-            logger.info("[ENGINE] PHASE 2 통과 종목 없음")
+            logger.info("[ENGINE] PHASE 2 통과 종목 없음 — 종료")
             return
 
-        # 4. PHASE 3/4: V자 반등 감지
-        final_candidates = []
+        # ═══ PHASE 3: 심리적 검증 + VETO ═══
+        logger.info("[ENGINE] PHASE 3: 심리적 검증 + VETO")
+        phase3_passed = []
         for stock in tech_passed:
-            realtime_data = self.intraday_analyzer.get_realtime_data(stock['stock_code'])
-            is_v_passed, v_score = self.intraday_analyzer.phase3_v_pattern(
-                stock['stock_code'], realtime_data
+            symbol = stock.get('stock_code', '')
+            name = stock.get('stock_name', '')
+
+            # VETO 스캔
+            news_items = stock.get("news_items", [])
+            veto_result = self.veto_scanner.scan_news_list(symbol, name, news_items)
+            if veto_result.is_vetoed:
+                logger.warning(f"[ENGINE] {name} VETO 발동 — 제외")
+                continue
+
+            # 심리적 점수 산출
+            headlines = [item.get("title", "") for item in news_items]
+            power_kws = find_power_keywords(headlines)
+
+            sent_data = SentimentData(
+                symbol=symbol,
+                google_article_count=stock.get("google_news_count", 0),
+                positive_ratio=stock.get("positive_ratio", 0.5),
+                negative_ratio=stock.get("negative_ratio", 0.1),
+                headlines=headlines,
+                naver_top_10=stock.get("naver_top_exposure", False),
+                forum_post_count=stock.get("forum_post_count", 0),
+                theme_expected_days=stock.get("theme_expected_days", 0),
+                power_keywords_found=power_kws,
             )
 
-            if is_v_passed:
-                stock['phase3_score'] = v_score
-                # V자 반등에서 수집한 실시간 데이터 병합
-                stock.update({
-                    'sell_order_qty': realtime_data.get('sell_order_qty', 0),
-                    'buy_order_qty': realtime_data.get('buy_order_qty', 0),
-                    'expected_close_price': realtime_data.get('expected_close_price', 0),
-                    'price_at_1520': realtime_data.get('current_price', 0),
-                    'buy_order_surge': realtime_data.get('buy_order_surge', False),
-                    'expected_price_rising': realtime_data.get('expected_price_rising', False),
-                    'open_price': realtime_data.get('open_price', 0),
-                    'close_price_yesterday': realtime_data.get('close_price_yesterday', 0),
-                    'current_price': realtime_data.get('current_price', stock.get('current_price', 0)),
-                })
-                final_candidates.append(stock)
+            passed, score, details = phase3_score(sent_data)
+            stock['phase3_score'] = score
+            stock['phase3_details'] = details
+            stock['sentiment_data'] = sent_data
 
-        if not final_candidates:
-            logger.info("[ENGINE] V자 반등 조건 충족 종목 없음")
+            if passed:
+                phase3_passed.append(stock)
+                logger.info(f"  [PASS] {name} | 심리점수={score}")
+
+        if not phase3_passed:
+            logger.info("[ENGINE] PHASE 3 통과 종목 없음 — 종료")
             return
 
-        # 5. COMMANDER 앙상블 의사결정
-        account = self.api.get_balance()
-        decisions = self.command_center.get_commander_decision(
-            final_candidates,
-            market_condition=mc,
-            account_info=account,
+        # 상위 5개로 축소 (PHASE 2+3 합산 점수 기준)
+        phase3_passed.sort(
+            key=lambda s: s.get('phase2_score', 0) + s.get('phase3_score', 0),
+            reverse=True,
         )
+        final_candidates = phase3_passed[:5]
+        logger.info(f"[ENGINE] PHASE 3 최종 후보: {len(final_candidates)}개")
 
-        # 6. 주문 실행 + DB 기록
-        for decision in decisions:
-            if decision['action'] != "BUY":
+        # ═══ PHASE 4: V자 반등 + 앙상블 진입 ═══
+        logger.info("[ENGINE] PHASE 4: V자 반등 + 앙상블 진입")
+        account = self.api.get_balance()
+        total_asset = account.get('total_asset', account.get('cash', 0))
+        cash = account.get('cash', 0)
+        current_cash_ratio = cash / total_asset if total_asset > 0 else 1.0
+        position_count = len(self.portfolio.get('holdings', []))
+
+        buy_orders = []
+
+        for stock in final_candidates:
+            symbol = stock.get('stock_code', '')
+            name = stock.get('stock_name', '')
+
+            # V자 반등 감지
+            realtime_data = self.intraday_analyzer.get_realtime_data(symbol)
+            is_v, v_score, v_details = self.intraday_analyzer.phase4_v_pattern(
+                symbol, realtime_data
+            )
+
+            if not is_v:
+                logger.info(f"  [SKIP] {name} — V자 미충족")
                 continue
 
-            symbol = decision['symbol']
-            balance = account.get('cash', 0)
+            # 장중 억눌림 여부
+            open_price = realtime_data.get('open_price', stock.get('open_price', 0))
+            current_price = realtime_data.get('current_price', stock.get('current_price', 0))
+            intraday_return_negative = (
+                (current_price - open_price) / open_price < 0
+                if open_price > 0 else False
+            )
 
-            # 포지션 사이징 (앙상블 배수 반영)
-            kelly_fraction = self.kelly.calculate_kelly_fraction()
-            adjusted_fraction = kelly_fraction * decision.get('position_multiplier', 1.0)
-            adjusted_fraction = min(adjusted_fraction, Config.MAX_INVESTMENT_PER_STOCK_PCT)
+            # 4가지 로직 점수 산출
+            sent_data = stock.get('sentiment_data')
+            logic_scores = calculate_logic_scores(
+                change_pct=stock.get('change_rate', 0) / 100.0 if abs(stock.get('change_rate', 0)) > 1 else stock.get('change_rate', 0),
+                phase2_score_val=stock.get('phase2_score', 0),
+                v_score=v_score,
+                program_net_buy_3min=realtime_data.get('program_net_buy_3min', 0),
+                intraday_return_negative=intraday_return_negative,
+                moc_buy_imbalance=realtime_data.get('moc_buy_imbalance', False),
+                sell_order_qty=realtime_data.get('sell_order_qty', 0),
+                buy_order_qty=realtime_data.get('buy_order_qty', 0),
+                execution_strength=realtime_data.get('execution_strength', 0),
+                google_article_count=sent_data.google_article_count if sent_data else 0,
+                positive_ratio=sent_data.positive_ratio if sent_data else 0.5,
+                power_keywords_found=sent_data.power_keywords_found if sent_data else [],
+                theme_expected_days=sent_data.theme_expected_days if sent_data else 0,
+            )
 
-            # 현재가 조회
-            current_price = 0
-            for s in final_candidates:
-                if s.get('stock_code') == symbol:
-                    current_price = s.get('current_price', 0)
-                    break
+            ensemble_result = self.ensemble_scorer.score_with_logic_dict(
+                symbol, name, logic_scores
+            )
 
+            if ensemble_result.entry_tier == "SKIP":
+                logger.info(f"  [SKIP] {name} — 앙상블 {logic_scores['ensemble_score']}점 미달")
+                continue
+
+            # 진입 비중 결정
+            kelly_pct = self.kelly.calculate_kelly_fraction()
+            entry_weight = determine_entry_weight(
+                ensemble_score=logic_scores['ensemble_score'],
+                regime=regime.value,
+                kelly_pct=kelly_pct,
+                current_cash_ratio=current_cash_ratio,
+                position_count=position_count,
+            )
+
+            if entry_weight <= 0:
+                continue
+
+            # 주문 수량 계산
             if current_price <= 0:
                 continue
-
-            investment = int(balance * adjusted_fraction)
+            investment = int(cash * entry_weight)
             quantity = investment // current_price
-
             if quantity <= 0:
                 continue
 
@@ -172,21 +262,25 @@ class TradingEngine:
 
             if success:
                 logger.info(
-                    f"[ENGINE] 매수 완료: {decision['name']} "
-                    f"{quantity}주 @ {current_price:,}원 | "
-                    f"앙상블={decision['ensemble_score']:.1f}"
+                    f"[ENGINE] 매수: {name} {quantity}주 @ {current_price:,}원 | "
+                    f"앙상블={logic_scores['ensemble_score']:.1f} | "
+                    f"비중={entry_weight:.1%} | "
+                    f"주도={logic_scores['dominant_logic']}"
                 )
 
                 # 포트폴리오 업데이트
                 self.portfolio['holdings'].append({
                     "stock_code": symbol,
-                    "stock_name": decision['name'],
+                    "stock_name": name,
                     "quantity": quantity,
                     "entry_price": current_price,
                     "entry_time": datetime.now().strftime("%H:%M:%S"),
-                    "ensemble_score": decision['ensemble_score'],
-                    "entry_tier": decision['entry_tier'],
-                    "dominant_logic": decision['dominant_logic'],
+                    "ensemble_score": logic_scores['ensemble_score'],
+                    "entry_tier": ensemble_result.entry_tier,
+                    "dominant_logic": logic_scores['dominant_logic'],
+                    "phase2_score": stock.get('phase2_score', 0),
+                    "phase3_score": stock.get('phase3_score', 0),
+                    "v_score": v_score,
                 })
                 self.portfolio['buy_date'] = date.today().isoformat()
                 self._save_portfolio()
@@ -194,44 +288,90 @@ class TradingEngine:
                 # DB 기록
                 self.db.insert_trade({
                     "symbol": symbol,
-                    "name": decision['name'],
-                    "theme": "",
+                    "name": name,
+                    "theme": stock.get('theme', ''),
                     "entry_date": date.today().isoformat(),
                     "entry_time": datetime.now().strftime("%H:%M:%S"),
                     "entry_price": current_price,
                     "quantity": quantity,
-                    "weight_pct": decision.get('weight_pct', 0),
-                    "exit_date": None,
-                    "exit_time": None,
-                    "exit_price": None,
-                    "exit_scenario": None,
-                    "exit_reason": None,
-                    "pnl": None,
-                    "pnl_percent": None,
-                    "phase2_score": None,
-                    "phase3_score": None,
-                    "v_pattern_score": None,
-                    "ensemble_score": decision['ensemble_score'],
-                    "logic1_tow_score": decision['logic_scores'].get('tug_of_war', 0),
-                    "logic2_v_score": decision['logic_scores'].get('v_pattern', 0),
-                    "logic3_moc_score": decision['logic_scores'].get('moc_imbalance', 0),
-                    "logic4_news_score": decision['logic_scores'].get('news_temporal', 0),
-                    "ai_confidence": decision['confidence'],
-                    "notes": decision.get('reasoning', ''),
+                    "weight_pct": round(entry_weight * 100, 1),
+                    "exit_date": None, "exit_time": None, "exit_price": None,
+                    "exit_scenario": None, "exit_reason": None,
+                    "pnl": None, "pnl_percent": None,
+                    "phase2_score": stock.get('phase2_score', 0),
+                    "phase3_score": stock.get('phase3_score', 0),
+                    "v_pattern_score": v_score,
+                    "ensemble_score": logic_scores['ensemble_score'],
+                    "logic1_tow_score": logic_scores['logic1_tow'],
+                    "logic2_v_score": logic_scores['logic2_v'],
+                    "logic3_moc_score": logic_scores['logic3_moc'],
+                    "logic4_news_score": logic_scores['logic4_news'],
+                    "ai_confidence": min(int(logic_scores['ensemble_score']), 100),
+                    "notes": f"주도로직={logic_scores['dominant_logic']} 레짐={regime.value}",
                 })
 
-    def run_morning_strategy(self):
-        """
-        익일 오전 청산 전략 실행 (09:00 ~ 10:00) -- v2.0
+                position_count += 1
+                cash -= investment
+                current_cash_ratio = cash / total_asset if total_asset > 0 else 0
 
-        시나리오 A~D + STOP + EMERGENCY 판단 후 청산
-        """
+                buy_orders.append({
+                    "symbol": symbol, "name": name,
+                    "quantity": quantity, "price": current_price,
+                    "ensemble": logic_scores['ensemble_score'],
+                })
+
+        if not buy_orders:
+            logger.info("[ENGINE] PHASE 4 진입 조건 충족 종목 없음")
+        else:
+            logger.info(f"[ENGINE] 총 {len(buy_orders)}개 종목 매수 완료")
+
+    # ═══════════════════════════════════════════════════════
+    # 장후 리스크 관리
+    # ═══════════════════════════════════════════════════════
+
+    def run_after_hours_check(self):
+        """장후 리스크 관리 (15:30~18:00)"""
         if not self.portfolio['holdings']:
-            logger.info("[ENGINE] 보유 종목 없음 - 청산 불필요")
             return
 
         logger.info("=" * 60)
-        logger.info("[ENGINE] 오전 청산 전략 실행 시작 (v2.0)")
+        logger.info("[ENGINE] 장후 리스크 관리 시작")
+        logger.info("=" * 60)
+
+        for holding in self.portfolio['holdings']:
+            symbol = holding['stock_code']
+            name = holding['stock_name']
+            qty = holding['quantity']
+
+            after_data = self.api.get_realtime_analysis_data(symbol)
+            result = after_hours_risk_check(
+                symbol=symbol,
+                sell_order_qty=after_data.get('sell_order_qty', 0),
+                buy_order_qty=after_data.get('buy_order_qty', 0),
+                after_hours_change=after_data.get('after_hours_change', 0),
+                holding_qty=qty,
+            )
+
+            if result['action'] == 'PARTIAL_SELL' and result['sell_qty'] > 0:
+                logger.info(f"[ENGINE] 장후 정리: {name} {result['sell_qty']}주 | {result['reason']}")
+
+    # ═══════════════════════════════════════════════════════
+    # 익일 오전 청산 (PHASE 5)
+    # ═══════════════════════════════════════════════════════
+
+    def run_morning_strategy(self):
+        """
+        익일 오전 청산 전략 실행 (08:30~10:00)
+
+        시나리오 A~D + STOP + EMERGENCY 판단 후 분할/전량 청산
+        10:00 = 무조건 전량 강제 청산
+        """
+        if not self.portfolio['holdings']:
+            logger.info("[ENGINE] 보유 종목 없음 — 청산 불필요")
+            return
+
+        logger.info("=" * 60)
+        logger.info("[ENGINE] PHASE 5: 오전 청산 전략 시작 (v2.0)")
         logger.info("=" * 60)
 
         holdings_to_remove = []
@@ -249,21 +389,26 @@ class TradingEngine:
 
             current_price = price_info['current_price']
             open_price = price_info.get('open_price', current_price)
+            kospi_change = price_info.get('kospi_change', 0)
+            ma20 = price_info.get('ma20', 0)
+            high_since_open = price_info.get('high_since_open', current_price)
 
             # 시나리오 판단
-            scenario, reason = self.morning_monitor.determine_exit_scenario(
+            scenario, reason, sell_ratio = determine_exit_scenario(
                 entry_price=entry_price,
                 open_price=open_price,
                 current_price=current_price,
                 current_time=datetime.now(),
-                kospi_change=0,
+                kospi_change=kospi_change,
+                ma20=ma20,
+                high_since_open=high_since_open,
             )
 
             # 청산 실행
-            exit_action = self.morning_monitor.execute_exit(scenario, quantity)
+            exit_result = execute_exit(scenario, sell_ratio, quantity)
 
-            if exit_action['action'] == 'SELL' and exit_action['qty'] > 0:
-                sell_qty = exit_action['qty']
+            if exit_result['action'] == 'SELL' and exit_result['sell_qty'] > 0:
+                sell_qty = exit_result['sell_qty']
                 success = self.api.place_order(symbol, sell_qty, 0, "sell")
 
                 if success:
@@ -277,13 +422,19 @@ class TradingEngine:
                         f"사유={reason}"
                     )
 
-                    if sell_qty >= quantity:
+                    remaining = exit_result['remaining_qty']
+                    if remaining <= 0:
                         holdings_to_remove.append(i)
+                    else:
+                        holding['quantity'] = remaining
 
-        # 청산된 종목 제거
         for idx in sorted(holdings_to_remove, reverse=True):
             self.portfolio['holdings'].pop(idx)
         self._save_portfolio()
+
+    # ═══════════════════════════════════════════════════════
+    # 유틸리티
+    # ═══════════════════════════════════════════════════════
 
     def scan_market(self):
         """시장 스캔 (정보 수집용)"""
@@ -309,16 +460,15 @@ class TradingEngine:
                 f"앙상블={h.get('ensemble_score', 'N/A')}"
             )
 
-        # 거시 상태 출력
-        macro = self.command_center.get_macro_status()
+        macro = self.macro_filter.get_regime_summary()
         logger.info(f"  레짐={macro.get('regime', 'N/A')} | "
                      f"진입가능={macro.get('entry_allowed', 'N/A')}")
         logger.info("=" * 60)
 
     def execute_closing_bet(self):
-        """종가 베팅 실행 (run_closing_strategy 래퍼)"""
+        """종가 베팅 실행 (래퍼)"""
         self.run_closing_strategy()
 
     def execute_morning_sell(self):
-        """오전 매도 실행 (run_morning_strategy 래퍼)"""
+        """오전 매도 실행 (래퍼)"""
         self.run_morning_strategy()
